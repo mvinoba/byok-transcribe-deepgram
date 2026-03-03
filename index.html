@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deepgram Audio Transcriber</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --card: #ffffff;
+      --text: #1f2933;
+      --muted: #52606d;
+      --accent: #0b7285;
+      --border: #d9e2ec;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+    }
+
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 1.35rem;
+    }
+
+    p {
+      margin: 8px 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    label {
+      display: block;
+      margin-top: 14px;
+      font-weight: 600;
+    }
+
+    input[type="password"],
+    input[type="file"],
+    button,
+    textarea {
+      width: 100%;
+      margin-top: 6px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      padding: 10px 12px;
+      background: #fff;
+    }
+
+    button {
+      cursor: pointer;
+      background: #f8fafc;
+    }
+
+    button:hover:enabled {
+      border-color: var(--accent);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .small {
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    .status {
+      min-height: 1.4em;
+      margin-top: 10px;
+      font-weight: 600;
+    }
+
+    textarea {
+      min-height: 280px;
+      resize: vertical;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Deepgram Pre-Recorded Transcriber</h1>
+    <p>Defaults: <code>model=nova-3</code>, speaker recognition, punctuation, smart formatting, and paragraph-friendly output.</p>
+    <p class="small">
+      Deepgram supports 100+ formats. Common documented extensions:
+      <code>.mp3, .mp4, .mp2, .aac, .wav, .flac, .pcm, .m4a, .ogg, .opus, .webm</code>.
+    </p>
+
+    <label for="apiKey">Deepgram API Key (saved in localStorage)</label>
+    <input id="apiKey" type="password" placeholder="dg_xxx...">
+    <button id="saveKeyBtn" type="button">Save API Key</button>
+    <div id="keyStatus" class="small"></div>
+
+    <label for="fileInput">Audio / Video File</label>
+    <input
+      id="fileInput"
+      type="file"
+      accept=".mp3,.mp4,.mp2,.aac,.wav,.flac,.pcm,.m4a,.ogg,.opus,.webm,audio/*,video/*">
+    <div id="fileInfo" class="small">No file selected.</div>
+    <div id="etaInfo" class="small"></div>
+
+    <div class="row">
+      <button id="transcribeBtn" type="button" disabled>Transcribe</button>
+      <button id="downloadBtn" type="button" disabled>Download TXT</button>
+    </div>
+
+    <div id="status" class="status"></div>
+    <textarea id="output" readonly placeholder="Transcript will appear here..."></textarea>
+  </main>
+
+  <script>
+    const STORAGE_KEY = "deepgram_api_key";
+    const DEEPGRAM_URL = "https://api.deepgram.com/v1/listen";
+
+    const apiKeyInput = document.getElementById("apiKey");
+    const saveKeyBtn = document.getElementById("saveKeyBtn");
+    const keyStatus = document.getElementById("keyStatus");
+    const fileInput = document.getElementById("fileInput");
+    const fileInfo = document.getElementById("fileInfo");
+    const etaInfo = document.getElementById("etaInfo");
+    const transcribeBtn = document.getElementById("transcribeBtn");
+    const downloadBtn = document.getElementById("downloadBtn");
+    const statusEl = document.getElementById("status");
+    const output = document.getElementById("output");
+
+    let selectedFile = null;
+    let transcriptText = "";
+
+    const savedApiKey = localStorage.getItem(STORAGE_KEY);
+    if (savedApiKey) {
+      apiKeyInput.value = savedApiKey;
+      keyStatus.textContent = "API key loaded from localStorage.";
+    }
+
+    function updateButtons() {
+      const hasKey = apiKeyInput.value.trim().length > 0;
+      const hasFile = !!selectedFile;
+      transcribeBtn.disabled = !(hasKey && hasFile);
+      downloadBtn.disabled = transcriptText.trim().length === 0;
+    }
+
+    function formatDuration(seconds) {
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        return "unknown";
+      }
+      if (seconds < 60) {
+        return `${seconds.toFixed(1)}s`;
+      }
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.round(seconds % 60);
+      return `${mins}m ${secs}s`;
+    }
+
+    async function getMediaDuration(file) {
+      return new Promise((resolve) => {
+        const media = document.createElement("video");
+        const objectUrl = URL.createObjectURL(file);
+        media.preload = "metadata";
+        media.src = objectUrl;
+
+        const cleanup = () => {
+          URL.revokeObjectURL(objectUrl);
+        };
+
+        media.onloadedmetadata = () => {
+          const duration = media.duration;
+          cleanup();
+          if (Number.isFinite(duration) && duration > 0) {
+            resolve(duration);
+            return;
+          }
+          resolve(null);
+        };
+
+        media.onerror = () => {
+          cleanup();
+          resolve(null);
+        };
+      });
+    }
+
+    function buildTranscript(responseData) {
+      const utterances = responseData?.results?.utterances;
+      if (Array.isArray(utterances) && utterances.length > 0) {
+        // Merge adjacent utterances from the same speaker to reduce utterance-level fragmentation.
+        const merged = [];
+        for (const utterance of utterances) {
+          const text = (utterance?.transcript || "").trim();
+          if (!text) {
+            continue;
+          }
+          const speakerId = Number.isFinite(utterance?.speaker) ? utterance.speaker : "?";
+          const speaker = `Speaker ${speakerId}`;
+          const last = merged[merged.length - 1];
+          if (last && last.speaker === speaker) {
+            last.text = `${last.text} ${text}`.replace(/\s+/g, " ").trim();
+          } else {
+            merged.push({ speaker, text });
+          }
+        }
+        if (merged.length > 0) {
+          return merged.map((entry) => `[${entry.speaker}] ${entry.text}`).join("\n\n");
+        }
+      }
+
+      const firstAlt = responseData?.results?.channels?.[0]?.alternatives?.[0];
+      const paragraphText = firstAlt?.paragraphs?.transcript;
+      const plainText = firstAlt?.transcript;
+      return (paragraphText || plainText || "").trim();
+    }
+
+    saveKeyBtn.addEventListener("click", () => {
+      const key = apiKeyInput.value.trim();
+      if (!key) {
+        keyStatus.textContent = "Enter a key first.";
+        return;
+      }
+      localStorage.setItem(STORAGE_KEY, key);
+      keyStatus.textContent = "API key saved.";
+      updateButtons();
+    });
+
+    apiKeyInput.addEventListener("input", updateButtons);
+
+    fileInput.addEventListener("change", async () => {
+      selectedFile = fileInput.files?.[0] || null;
+      transcriptText = "";
+      output.value = "";
+      statusEl.textContent = "";
+
+      if (!selectedFile) {
+        fileInfo.textContent = "No file selected.";
+        etaInfo.textContent = "";
+        updateButtons();
+        return;
+      }
+
+      fileInfo.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB)`;
+      etaInfo.textContent = "Calculating ETA...";
+
+      const durationSeconds = await getMediaDuration(selectedFile);
+      if (durationSeconds) {
+        const etaSeconds = durationSeconds / 200;
+        etaInfo.textContent = `Estimated transcription time: ~${formatDuration(etaSeconds)} (duration ${formatDuration(durationSeconds)} / 200).`;
+      } else {
+        etaInfo.textContent = "ETA unavailable (could not read media duration).";
+      }
+
+      updateButtons();
+    });
+
+    transcribeBtn.addEventListener("click", async () => {
+      const apiKey = apiKeyInput.value.trim();
+      if (!apiKey || !selectedFile) {
+        return;
+      }
+
+      localStorage.setItem(STORAGE_KEY, apiKey);
+      transcribeBtn.disabled = true;
+      downloadBtn.disabled = true;
+      statusEl.textContent = "Uploading file to Deepgram and transcribing...";
+      output.value = "";
+      transcriptText = "";
+
+      try {
+        const query = new URLSearchParams({
+          model: "nova-3",
+          diarize: "true",
+          punctuate: "true",
+          smart_format: "true",
+          paragraphs: "true",
+          utterances: "true"
+        });
+
+        const response = await fetch(`${DEEPGRAM_URL}?${query.toString()}`, {
+          method: "POST",
+          headers: {
+            Authorization: `Token ${apiKey}`,
+            "Content-Type": selectedFile.type || "application/octet-stream"
+          },
+          body: selectedFile
+        });
+
+        if (!response.ok) {
+          const errorBody = await response.text();
+          throw new Error(`Deepgram request failed (${response.status}): ${errorBody.slice(0, 240)}`);
+        }
+
+        const data = await response.json();
+        const builtText = buildTranscript(data);
+        if (!builtText) {
+          throw new Error("Deepgram returned no transcript text.");
+        }
+
+        transcriptText = builtText;
+        output.value = transcriptText;
+        statusEl.textContent = "Done. Transcript is ready and can be downloaded as .txt.";
+      } catch (error) {
+        statusEl.textContent = `Error: ${error.message}`;
+      } finally {
+        updateButtons();
+      }
+    });
+
+    downloadBtn.addEventListener("click", () => {
+      if (!transcriptText.trim()) {
+        return;
+      }
+      const safeBase = (selectedFile?.name || "transcript")
+        .replace(/\.[^/.]+$/, "")
+        .replace(/[^a-zA-Z0-9_-]+/g, "_");
+      const filename = `${safeBase || "transcript"}_transcript.txt`;
+      const blob = new Blob([transcriptText], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      statusEl.textContent = "Done. Transcript downloaded.";
+    });
+
+    updateButtons();
+  </script>
+</body>
+</html>
