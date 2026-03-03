@@ -150,6 +150,7 @@
     const output = document.getElementById("output");
 
     let selectedFile = null;
+    let mediaDurationSeconds = null;
     let transcriptText = "";
 
     const savedApiKey = localStorage.getItem(STORAGE_KEY);
@@ -251,6 +252,7 @@
     fileInput.addEventListener("change", async () => {
       selectedFile = fileInput.files?.[0] || null;
       transcriptText = "";
+      mediaDurationSeconds = null;
       output.value = "";
       statusEl.textContent = "";
 
@@ -264,10 +266,10 @@
       fileInfo.textContent = `Selected: ${selectedFile.name} (${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB)`;
       etaInfo.textContent = "Calculating ETA...";
 
-      const durationSeconds = await getMediaDuration(selectedFile);
-      if (durationSeconds) {
-        const etaSeconds = durationSeconds / 200;
-        etaInfo.textContent = `Estimated transcription time: ~${formatDuration(etaSeconds)} (duration ${formatDuration(durationSeconds)} / 200).`;
+      mediaDurationSeconds = await getMediaDuration(selectedFile);
+      if (mediaDurationSeconds) {
+        const etaSeconds = mediaDurationSeconds / 200;
+        etaInfo.textContent = `Estimated server processing time (starts after upload): ~${formatDuration(etaSeconds)} (duration ${formatDuration(mediaDurationSeconds)} / 200).`;
       } else {
         etaInfo.textContent = "ETA unavailable (could not read media duration).";
       }
@@ -284,7 +286,7 @@
       localStorage.setItem(STORAGE_KEY, apiKey);
       transcribeBtn.disabled = true;
       downloadBtn.disabled = true;
-      statusEl.textContent = "Uploading file to Deepgram and transcribing...";
+      statusEl.textContent = "Uploading file to Deepgram...";
       output.value = "";
       transcriptText = "";
 
@@ -298,21 +300,46 @@
           utterances: "true"
         });
 
-        const response = await fetch(`${DEEPGRAM_URL}?${query.toString()}`, {
-          method: "POST",
-          headers: {
-            Authorization: `Token ${apiKey}`,
-            "Content-Type": selectedFile.type || "application/octet-stream"
-          },
-          body: selectedFile
+        const data = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", `${DEEPGRAM_URL}?${query.toString()}`);
+          xhr.setRequestHeader("Authorization", `Token ${apiKey}`);
+          xhr.setRequestHeader("Content-Type", selectedFile.type || "application/octet-stream");
+
+          xhr.upload.onprogress = (event) => {
+            if (!event.lengthComputable) {
+              return;
+            }
+            const pct = Math.min(100, Math.round((event.loaded / event.total) * 100));
+            statusEl.textContent = `Uploading file to Deepgram... ${pct}%`;
+          };
+
+          xhr.upload.onload = () => {
+            if (mediaDurationSeconds) {
+              const etaSeconds = mediaDurationSeconds / 200;
+              statusEl.textContent = `Upload complete. Deepgram processing started. ETA ~${formatDuration(etaSeconds)}.`;
+            } else {
+              statusEl.textContent = "Upload complete. Deepgram processing started.";
+            }
+          };
+
+          xhr.onerror = () => reject(new Error("Network error while sending request to Deepgram."));
+          xhr.ontimeout = () => reject(new Error("Deepgram request timed out."));
+          xhr.onload = () => {
+            if (xhr.status < 200 || xhr.status >= 300) {
+              reject(new Error(`Deepgram request failed (${xhr.status}): ${(xhr.responseText || "").slice(0, 240)}`));
+              return;
+            }
+            try {
+              resolve(JSON.parse(xhr.responseText));
+            } catch {
+              reject(new Error("Deepgram response was not valid JSON."));
+            }
+          };
+
+          xhr.send(selectedFile);
         });
 
-        if (!response.ok) {
-          const errorBody = await response.text();
-          throw new Error(`Deepgram request failed (${response.status}): ${errorBody.slice(0, 240)}`);
-        }
-
-        const data = await response.json();
         const builtText = buildTranscript(data);
         if (!builtText) {
           throw new Error("Deepgram returned no transcript text.");
